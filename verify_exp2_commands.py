@@ -71,14 +71,19 @@ def check_attack_params(cmd):
             issues.append("soft_prf缺少--item_freq_source")
     
     if '--attack point_level' in cmd:
-        if '--pl_top_k' not in cmd:
-            issues.append("point_level缺少--pl_top_k")
-        if '--pl_boost' not in cmd:
-            issues.append("point_level缺少--pl_boost")
+        if '--pl_penalty' not in cmd:
+            issues.append("point_level缺少--pl_penalty")
     
     if '--attack random_shuffle' in cmd:
-        if '--rs_noise_scale' not in cmd:
-            issues.append("random_shuffle缺少--rs_noise_scale")
+        if '--rs_mode region' in cmd or '--rs_mode=region' in cmd:
+            if '--rs_region_beta' not in cmd:
+                issues.append("region mode缺少--rs_region_beta")
+        if '--rs_mode trajectory' in cmd or '--rs_mode=trajectory' in cmd:
+            if '--rs_traj_penalty' not in cmd:
+                issues.append("trajectory mode缺少--rs_traj_penalty")
+            if '--rs_traj_k3' in cmd or '--rs_traj_k4' in cmd:
+                if '--rs_traj_depth_decay' not in cmd:
+                    issues.append("deep trajectory缺少--rs_traj_depth_decay")
     
     if '--item_freq_source qee' in cmd:
         if '--freq_query_topk' not in cmd:
@@ -126,8 +131,21 @@ def main():
         (f"{base_cmd} {base_args} --method cold --attack none",
          "B0: Baseline (无攻击) - COLD"),
         
-        (f"{base_cmd} {base_args} --method cold --attack random_shuffle --rs_noise_scale 1.0",
+        # 随机基线 (COLD: 原始高斯噪声)
+        (f"{base_cmd} {base_args} --method cold --attack random_shuffle --rs_mode random --rs_noise_scale 1.0",
          "B1: Random Baseline - COLD"),
+        
+        # 随机基线 (POP: 区域抑制模式)
+        (f"{base_cmd} {base_args} --method pop --attack random_shuffle --rs_mode region --rs_region_low 0.2 --rs_region_high 0.5 --rs_region_beta 5.0",
+         "R1: Region Suppress Baseline - POP"),
+        
+        # 轨迹攻击 (POP: 模型查询续接路径)
+        (f"{base_cmd} {base_args} --method pop --attack random_shuffle --rs_mode trajectory --rs_traj_k1 3 --rs_traj_k2 1 --rs_traj_penalty 5.0",
+         "T1: Trajectory Suppress - POP (k1=3, k2=1)"),
+        
+        # 深度轨迹攻击 (POP: 3级深度)
+        (f"{base_cmd} {base_args} --method pop --attack random_shuffle --rs_mode trajectory --rs_traj_k1 5 --rs_traj_k2 2 --rs_traj_k3 1 --rs_traj_penalty 5.0 --rs_traj_depth_decay 0.7",
+         "T2: Deep Trajectory - POP (k1=5,k2=2,k3=1)"),
         
         # Soft-PRF 攻击
         (f"{base_cmd} {base_args} --method cold --attack soft_prf --attack_direction suppress_unpopular --item_freq_source data --prf_gamma 0.7 --prf_beta 5.0 --prf_eps 0.02",
@@ -137,10 +155,10 @@ def main():
          "A2: Soft-PRF Data-Unaware (QEE) - COLD"),
         
         # Point-Level 攻击
-        (f"{base_cmd} {base_args} --method cold --attack point_level --attack_direction suppress_unpopular --item_freq_source data --pl_top_k 50 --pl_boost 5.0",
+        (f"{base_cmd} {base_args} --method cold --attack point_level --attack_direction suppress_unpopular --item_freq_source data --pl_penalty 5.0",
          "A1': Point-Level Data-Aware - COLD"),
         
-        (f"{base_cmd} {base_args} --method cold --attack point_level --attack_direction suppress_unpopular --item_freq_source qee --pl_top_k 50 --pl_boost 5.0 --freq_query_topk 20",
+        (f"{base_cmd} {base_args} --method cold --attack point_level --attack_direction suppress_unpopular --item_freq_source qee --pl_penalty 5.0 --freq_query_topk 20",
          "A2': Point-Level Data-Unaware (QEE) - COLD"),
         
         # Pop 对照组
@@ -149,6 +167,13 @@ def main():
         
         (f"{base_cmd} {base_args} --method pop --attack soft_prf --attack_direction suppress_popular --item_freq_source qee --prf_gamma 0.7 --prf_beta 5.0 --prf_eps 0.02 --freq_query_topk 20",
          "A4: Soft-PRF Data-Unaware (QEE) - POP"),
+        
+        # Point-Level POP 攻击
+        (f"{base_cmd} {base_args} --method pop --attack point_level --attack_direction suppress_popular --item_freq_source data --pl_penalty 5.0",
+         "P1: Point-Level Data-Aware - POP"),
+        
+        (f"{base_cmd} {base_args} --method pop --attack point_level --attack_direction suppress_popular --item_freq_source qee --pl_penalty 5.0 --freq_query_topk 20",
+         "P2: Point-Level Data-Unaware (QEE) - POP"),
     ]
     
     print(f"\n{Colors.BOLD}=== 命令语法验证 ==={Colors.RESET}")

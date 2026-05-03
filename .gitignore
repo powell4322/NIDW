@@ -1,9 +1,9 @@
-# 忽略大文件夹
+
 data/
 experiments/
+sequence pattern/
 
 
-# 忽略临时文件、缓存文件
 __pycache__/
 *.pyc
 *.pyo

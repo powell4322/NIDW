@@ -234,14 +234,36 @@ parser.add_argument('--prf_gamma', type=float, default=0.7)
 parser.add_argument('--prf_beta', type=float, default=5.0)
 parser.add_argument('--prf_eps', type=float, default=0.02,
                     help='Soft-PRF transition smoothness epsilon')
-parser.add_argument('--pl_top_k', type=int, default=50,
-                    help='Point-Level attack: number of top popular items to boost')
-parser.add_argument('--pl_boost', type=float, default=5.0,
-                    help='Point-Level attack: score boost magnitude for popular items')
+parser.add_argument('--pl_penalty', type=float, default=5.0,
+                    help='Point-Level attack: score penalty applied to the single target item (most extreme in popularity)')
 parser.add_argument('--rs_noise_scale', type=float, default=1.0,
                     help='Random Shuffle attack: standard deviation of Gaussian noise')
 parser.add_argument('--rs_seed', type=int, default=42,
                     help='Random Shuffle attack: random seed for reproducibility')
+parser.add_argument('--rs_mode', type=str, default='random', choices=['random', 'region', 'trajectory'],
+                    help='Random Shuffle mode: random (Gaussian noise), region (SoftPRF-like band), or trajectory (model-query continuation path)')
+parser.add_argument('--rs_region_low', type=float, default=0.2,
+                    help='Random Shuffle region mode: lower quantile bound of penalty band')
+parser.add_argument('--rs_region_high', type=float, default=0.5,
+                    help='Random Shuffle region mode: upper quantile bound of penalty band')
+parser.add_argument('--rs_region_beta', type=float, default=5.0,
+                    help='Random Shuffle region mode: penalty strength inside the band')
+parser.add_argument('--rs_traj_k1', type=int, default=3,
+                    help='Random Shuffle trajectory mode: top-K predictions at level 1')
+parser.add_argument('--rs_traj_k2', type=int, default=1,
+                    help='Random Shuffle trajectory mode: top-K predictions at level 2 (per branch)')
+parser.add_argument('--rs_traj_k3', type=int, default=0,
+                    help='Random Shuffle trajectory mode: top-K at level 3 (0=disabled)')
+parser.add_argument('--rs_traj_k4', type=int, default=0,
+                    help='Random Shuffle trajectory mode: top-K at level 4 (0=disabled)')
+parser.add_argument('--rs_traj_penalty', type=float, default=5.0,
+                    help='Random Shuffle trajectory mode: base penalty strength')
+parser.add_argument('--rs_traj_depth_decay', type=float, default=0.7,
+                    help='Random Shuffle trajectory mode: penalty multiplier per deeper level')
+parser.add_argument('--rs_traj_confidence_weight', action='store_true',
+                    help='Random Shuffle trajectory mode: weight penalty by model softmax confidence')
+parser.add_argument('--rs_traj_trigger_topk', type=int, default=1,
+                    help='Random Shuffle trajectory mode: use top-K triggers instead of 1 (range attack for QEE)')
 parser.add_argument('--ptsc_alpha', type=float, default=6.0)
 parser.add_argument('--pcrmr_sigma', type=float, default=1.0)
 parser.add_argument('--attack_direction', type=str, default='suppress_popular', choices=['suppress_popular', 'suppress_unpopular'])

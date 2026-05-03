@@ -106,7 +106,26 @@ def train(args, export_root=None, resume=False):
             method=args.method,
             alpha=args.ptsc_alpha,
             sigma=args.pcrmr_sigma,
-            direction=args.attack_direction  # Passed from args
+            direction=args.attack_direction,
+            model=model if args.attack != 'none' else None,
+            args=args,
+            # RandomShuffle params
+            rs_mode=args.rs_mode,
+            rs_noise_scale=args.rs_noise_scale,
+            rs_seed=args.rs_seed,
+            rs_region_low=args.rs_region_low,
+            rs_region_high=args.rs_region_high,
+            rs_region_beta=args.rs_region_beta,
+            rs_traj_k1=args.rs_traj_k1,
+            rs_traj_k2=args.rs_traj_k2,
+            rs_traj_k3=args.rs_traj_k3,
+            rs_traj_k4=args.rs_traj_k4,
+            rs_traj_penalty=args.rs_traj_penalty,
+            rs_traj_depth_decay=args.rs_traj_depth_decay,
+            rs_traj_confidence_weight=args.rs_traj_confidence_weight,
+            rs_traj_trigger_topk=args.rs_traj_trigger_topk,
+            # PointLevel params
+            pl_penalty=args.pl_penalty,
         )
 
     # Setup Trainer

@@ -46,10 +46,27 @@ def save_standardized_results(export_root, args, attack_name, wm_metrics, util_m
     # Add attack parameters if applicable
     if attack_name != 'none':
         results['config']['attack_direction'] = getattr(args, 'attack_direction', 'suppress_popular')
+        results['config']['item_freq_source'] = getattr(args, 'item_freq_source', 'data')
+        # SoftPRF
         results['config']['prf_gamma'] = getattr(args, 'prf_gamma', 0.7)
         results['config']['prf_beta'] = getattr(args, 'prf_beta', 5.0)
         results['config']['prf_eps'] = getattr(args, 'prf_eps', 0.02)
-        results['config']['item_freq_source'] = getattr(args, 'item_freq_source', 'data')
+        # RandomShuffle
+        results['config']['rs_mode'] = getattr(args, 'rs_mode', 'random')
+        results['config']['rs_noise_scale'] = getattr(args, 'rs_noise_scale', 1.0)
+        results['config']['rs_region_low'] = getattr(args, 'rs_region_low', 0.2)
+        results['config']['rs_region_high'] = getattr(args, 'rs_region_high', 0.5)
+        results['config']['rs_region_beta'] = getattr(args, 'rs_region_beta', 5.0)
+        results['config']['rs_traj_k1'] = getattr(args, 'rs_traj_k1', 3)
+        results['config']['rs_traj_k2'] = getattr(args, 'rs_traj_k2', 1)
+        results['config']['rs_traj_k3'] = getattr(args, 'rs_traj_k3', 0)
+        results['config']['rs_traj_k4'] = getattr(args, 'rs_traj_k4', 0)
+        results['config']['rs_traj_penalty'] = getattr(args, 'rs_traj_penalty', 5.0)
+        results['config']['rs_traj_depth_decay'] = getattr(args, 'rs_traj_depth_decay', 0.7)
+        results['config']['rs_traj_confidence_weight'] = getattr(args, 'rs_traj_confidence_weight', False)
+        results['config']['rs_traj_trigger_topk'] = getattr(args, 'rs_traj_trigger_topk', 1)
+        # PointLevel
+        results['config']['pl_penalty'] = getattr(args, 'pl_penalty', 5.0)
     
     # Save JSON
     with open(json_path, 'w') as f:
@@ -65,6 +82,8 @@ def save_standardized_results(export_root, args, attack_name, wm_metrics, util_m
         'method': args.method,
         'pattern_len': args.pattern_len,
         'attack': attack_name,
+        'attack_mode': getattr(args, 'rs_mode', '') if attack_name == 'random_shuffle' else (
+                       getattr(args, 'attack_direction', '') if attack_name != 'none' else ''),
     }
     
     # Add key metrics

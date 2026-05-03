@@ -119,34 +119,46 @@ class SoftPRFAttack:
 
 class PointLevelAttack:
     """
-    Direct Point-Level Attack: Replace initial items with popular alternatives.
+    Point-Level Attack: Suppress the single most extreme item (popularity-wise).
     
-    For cold-start watermarks targeting OOD items, directly boost the scores of 
-    in-distribution (popular) items while suppressing OOD items.
+    Unlike SoftPRF which applies a continuous penalty to ALL items based on rank,
+    this attack targets ONLY ONE item — the most extreme point in the popularity
+    distribution relevant to the watermark type:
     
-    Mechanism:
-    - Identifies top-k most popular items (in-distribution candidates)
-    - Applies score boosting to encourage replacement of watermarked initial items
-    - Supports different replacement strategies
+      - Cold watermarks (suppress_unpopular): target the single LEAST popular item
+      - Pop watermarks  (suppress_popular):   target the single MOST  popular item
+    
+    Both directions use score PENALTY (score - penalty), mimicking SoftPRF's
+    suppression mechanism but on a single critical point.
     """
     
-    def __init__(self, item_freq, top_k=50, boost_magnitude=5.0, direction='suppress_unpopular'):
+    def __init__(self, item_freq, penalty_magnitude=5.0, direction='suppress_unpopular'):
         """
         item_freq: Tensor [num_items], normalized frequency (sum=1)
-        top_k: number of top popular items to boost
-        boost_magnitude: score boost amount for popular items
-        direction: 'suppress_unpopular' (cold attack) or 'suppress_popular' (pop mitigation)
+        penalty_magnitude: score penalty applied to the single target item
+        direction: 'suppress_unpopular' (cold: target least popular) 
+                   or 'suppress_popular' (pop: target most popular)
         """
         self.device = item_freq.device
         self.num_items = item_freq.size(0)
-        self.top_k = min(top_k, self.num_items)
-        self.boost_magnitude = boost_magnitude
+        self.penalty_magnitude = penalty_magnitude
         self.direction = direction
         
-        # Identify top-k popular items
-        _, top_indices = torch.topk(item_freq, k=self.top_k, dim=0)
-        self.top_popular_mask = torch.zeros(self.num_items, dtype=torch.bool, device=self.device)
-        self.top_popular_mask[top_indices] = True
+        # Find the single target item at the extreme end of popularity
+        sorted_indices = torch.argsort(item_freq)  # ascending: [0]=least popular, [-1]=most popular
+        
+        if direction == 'suppress_unpopular':
+            # Cold watermark: the initial item is the LEAST popular item → suppress it
+            self.target_item_idx = sorted_indices[0].item()
+            print(f"  [PointLevel] Cold mode: targeting least popular item (freq_rank≈0, item_id={self.target_item_idx})")
+        else:
+            # Pop watermark: the initial item is the MOST popular item → suppress it
+            self.target_item_idx = sorted_indices[-1].item()
+            print(f"  [PointLevel] Pop mode: targeting most popular item (freq_rank≈1, item_id={self.target_item_idx})")
+        
+        # Create a mask marking just this single item
+        self.target_item_mask = torch.zeros(self.num_items, dtype=torch.bool, device=self.device)
+        self.target_item_mask[self.target_item_idx] = True
     
     def __call__(self, scores):
         """
@@ -155,14 +167,9 @@ class PointLevelAttack:
         # Extract item scores (exclude padding token 0 and mask token at position -1)
         item_scores = scores[:, 1:1+self.num_items]
         
-        if self.direction == 'suppress_unpopular':
-            # Cold-start attack: boost popular items to push out unpopular OOD items
-            boost = self.boost_magnitude * self.top_popular_mask.float()
-            item_scores = item_scores + boost
-        else:
-            # Pop mitigation: suppress popular items (opposite effect)
-            suppress = self.boost_magnitude * self.top_popular_mask.float()
-            item_scores = item_scores - suppress
+        # Apply score PENALTY to the single target item (always suppress, like SoftPRF)
+        penalty = self.penalty_magnitude * self.target_item_mask.float()
+        item_scores = item_scores - penalty
         
         scores[:, 1:1+self.num_items] = item_scores
         return scores
@@ -170,33 +177,159 @@ class PointLevelAttack:
 
 class RandomShuffleAttack:
     """
-    Baseline Attack: Random score perturbation.
-    
-    Shuffles item scores randomly within a given range to serve as a baseline
-    for evaluating attack effectiveness. Used to distinguish watermark-specific
-    vulnerabilities from general robustness issues.
+    Three-mode attack baseline.
+
+    Mode 'random' (original):
+        Adds Gaussian noise to all item scores.
+
+    Mode 'region' (targeted SoftPRF-like suppression):
+        Applies smooth penalty to items in a specific popularity quantile band.
+
+    Mode 'trajectory' (model-query trajectory suppression, for POP):
+        Queries the watermarked model to find the most likely continuation path
+        from the most popular item, then suppresses those items.
+
+        Step 1: Find the most popular item (POP watermark trigger).
+        Step 2: Query model → top-K1 next-item predictions.
+        Step 3: For each K1 item, query model again → top-K2 prediction.
+        Step 4: Suppress all (K1 + K1*K2) trajectory items.
+
+        This is watermark-aware without knowing the exact watermark sequence:
+        it directly attacks the model's own learned watermark continuation path.
     """
-    
-    def __init__(self, item_freq, noise_scale=1.0, seed=42):
+
+    def __init__(self, item_freq, noise_scale=1.0, seed=42,
+                 mode='random',
+                 region_low=0.2, region_high=0.5, region_beta=5.0, eps=0.02,
+                 trajectory_k1=3, trajectory_k2=1, trajectory_k3=0, trajectory_k4=0,
+                 trajectory_penalty=5.0, trajectory_depth_decay=0.7,
+                 trajectory_confidence_weight=False,
+                 trajectory_trigger_topk=1,
+                 model=None, args=None):
         """
-        item_freq: Tensor [num_items], normalized frequency (unused, kept for interface)
-        noise_scale: standard deviation of Gaussian noise
-        seed: random seed for reproducibility
+        item_freq: Tensor [num_items], normalized frequency
+        noise_scale: std of Gaussian noise (mode='random')
+        seed: random seed (mode='random')
+        mode: 'random' | 'region' | 'trajectory'
+        region_low/high/beta/eps: region mode params
+        trajectory_k1/k2/k3/k4: top-K per level (k3=0, k4=0 = disabled)
+        trajectory_penalty: base penalty strength
+        trajectory_depth_decay: penalty multiplier per deeper level (e.g. 0.7)
+        trajectory_confidence_weight: if True, weight penalty by model's softmax confidence
+        trajectory_trigger_topk: number of top triggers to use (default 1). >1 = multi-trigger range attack
+        model: watermarked model (required for 'trajectory' mode)
+        args: argparse namespace (required for 'trajectory' mode)
         """
         self.device = item_freq.device
         self.num_items = item_freq.size(0)
         self.noise_scale = noise_scale
         self.seed = seed
-        torch.manual_seed(seed)
-    
+        self.mode = mode
+
+        if mode == 'region':
+            freq_rank = torch.argsort(torch.argsort(item_freq)).float() / self.num_items
+            self.region_penalty = region_beta * (
+                torch.sigmoid((freq_rank - region_low) / eps) -
+                torch.sigmoid((freq_rank - region_high) / eps)
+            )
+            print(f"  [RandomShuffle] Region mode: penalty band=[{region_low:.1f}, {region_high:.1f}], beta={region_beta}")
+
+        elif mode == 'trajectory':
+            k_list = [k for k in [trajectory_k1, trajectory_k2, trajectory_k3, trajectory_k4] if k > 0]
+            self.trajectory_penalty = trajectory_penalty
+            self.trajectory_depth_decay = trajectory_depth_decay
+            self.trajectory_confidence_weight = trajectory_confidence_weight
+            self.trajectory_trigger_topk = max(1, int(trajectory_trigger_topk))
+            self._build_trajectory_targets_deep(item_freq, model, args, k_list)
+
+        else:  # 'random'
+            self.region_penalty = None
+            torch.manual_seed(seed)
+
+    def _build_trajectory_targets_deep(self, item_freq, model, args, k_list):
+        """
+        Multi-level trajectory query with optional multi-trigger support.
+
+        When self.trajectory_trigger_topk > 1, uses the top-K items from item_freq
+        as candidate triggers and unions all trajectory paths. This is essential for
+        Data-Unaware (QEE) scenarios where the estimated #1 item may be wrong.
+        """
+        model.eval()
+        num_items = self.num_items
+        max_len = args.bert_max_len
+        mask_token = num_items + 1
+
+        # Find trigger(s) from item_freq
+        sorted_indices = torch.argsort(item_freq)
+        trigger_topk = min(self.trajectory_trigger_topk, num_items)
+        trigger_0idx_list = sorted_indices[-trigger_topk:].tolist()
+
+        # Union all trajectory items across all triggers
+        all_target_items = {}  # item_0idx → max_weight
+
+        for t_idx, trigger_0idx in enumerate(trigger_0idx_list):
+            trigger_1idx = trigger_0idx + 1
+            frontier = [([trigger_1idx], 0)]
+
+            while frontier:
+                prefix_1idx, level_idx = frontier.pop(0)
+                if level_idx >= len(k_list):
+                    continue
+                k = k_list[level_idx]
+                if k <= 0:
+                    continue
+
+                padded_len = len(prefix_1idx) + 1
+                seq = [0] * (max_len - padded_len) + prefix_1idx + [mask_token]
+                seq_tensor = torch.LongTensor([seq]).to(self.device)
+
+                with torch.no_grad():
+                    logits = model(seq_tensor)
+                    last_scores = logits[0, -1, 1:1+num_items]
+
+                k_actual = min(k, num_items)
+                topk_values, topk_0idx = torch.topk(last_scores, k=k_actual, dim=-1)
+                base_weight = self.trajectory_depth_decay ** level_idx
+
+                for rank_idx in range(k_actual):
+                    item_0idx = topk_0idx[rank_idx].item()
+                    item_1idx = item_0idx + 1
+                    weight = base_weight
+                    if item_0idx not in all_target_items or weight > all_target_items[item_0idx]:
+                        all_target_items[item_0idx] = weight
+                    next_prefix = prefix_1idx + [item_1idx]
+                    next_level = level_idx + 1
+                    if next_level < len(k_list):
+                        frontier.append((next_prefix, next_level))
+
+            print(f"  [Trajectory] Trigger[{t_idx+1}/{trigger_topk}] ID={trigger_1idx}: "
+                  f"found {sum(1 for _,w in all_target_items.items() if w >= base_weight)} items so far")
+
+        target_0idx_list = list(all_target_items.keys())
+        weights_list = [all_target_items[idx] for idx in target_0idx_list]
+        print(f"  [Trajectory] Total unique target items across {trigger_topk} triggers: {len(target_0idx_list)} "
+              f"(weight range: [{min(weights_list):.4f}, {max(weights_list):.4f}])")
+
+        self.target_penalty_vector = torch.zeros(num_items, device=self.device)
+        for idx, w in zip(target_0idx_list, weights_list):
+            self.target_penalty_vector[idx] = w
+
     def __call__(self, scores):
-        """
-        scores: [B, num_items + 2]
-        Adds Gaussian noise to item scores for random perturbation baseline.
-        """
-        # Add random noise to item scores
-        noise = torch.randn_like(scores[:, 1:1+self.num_items]) * self.noise_scale
-        item_scores = scores[:, 1:1+self.num_items] + noise
+        item_scores = scores[:, 1:1+self.num_items]
+
+        if self.mode == 'region':
+            item_scores = item_scores - self.region_penalty
+        elif self.mode == 'trajectory':
+            penalty = self.trajectory_penalty * self.target_penalty_vector
+            n_affected = (self.target_penalty_vector > 0).sum().item()
+            max_pen = penalty.max().item()
+            print(f"  [Attack] Trajectory: {n_affected} items penalized, max_pen={max_pen:.2f}, "
+                  f"score_range=[{item_scores.min().item():.2f}, {item_scores.max().item():.2f}]")
+            item_scores = item_scores - penalty
+        else:  # 'random'
+            noise = torch.randn_like(item_scores) * self.noise_scale
+            item_scores = item_scores + noise
+
         scores[:, 1:1+self.num_items] = item_scores
         return scores
 
@@ -244,15 +377,29 @@ def build_attack(attack_name, item_freq, **kwargs):
     elif attack_name == "point_level":
         return PointLevelAttack(
             item_freq,
-            top_k=phi.get('top_k', kwargs.get('pl_top_k', 50)),
-            boost_magnitude=phi.get('boost_magnitude', kwargs.get('pl_boost', 5.0)),
+            penalty_magnitude=phi.get('penalty_magnitude', kwargs.get('pl_penalty', 5.0)),
             direction=direction
         )
     elif attack_name == "random_shuffle":
         return RandomShuffleAttack(
             item_freq,
             noise_scale=phi.get('noise_scale', kwargs.get('rs_noise_scale', 1.0)),
-            seed=phi.get('seed', kwargs.get('rs_seed', 42))
+            seed=phi.get('seed', kwargs.get('rs_seed', 42)),
+            mode=phi.get('mode', kwargs.get('rs_mode', 'random')),
+            region_low=phi.get('region_low', kwargs.get('rs_region_low', 0.2)),
+            region_high=phi.get('region_high', kwargs.get('rs_region_high', 0.5)),
+            region_beta=phi.get('region_beta', kwargs.get('rs_region_beta', 5.0)),
+            eps=phi.get('eps', kwargs.get('prf_eps', 0.02)),
+            trajectory_k1=phi.get('trajectory_k1', kwargs.get('rs_traj_k1', 3)),
+            trajectory_k2=phi.get('trajectory_k2', kwargs.get('rs_traj_k2', 1)),
+            trajectory_k3=phi.get('trajectory_k3', kwargs.get('rs_traj_k3', 0)),
+            trajectory_k4=phi.get('trajectory_k4', kwargs.get('rs_traj_k4', 0)),
+            trajectory_penalty=phi.get('trajectory_penalty', kwargs.get('rs_traj_penalty', 5.0)),
+            trajectory_depth_decay=phi.get('trajectory_depth_decay', kwargs.get('rs_traj_depth_decay', 0.7)),
+            trajectory_confidence_weight=phi.get('trajectory_confidence_weight', kwargs.get('rs_traj_confidence_weight', False)),
+            trajectory_trigger_topk=phi.get('trajectory_trigger_topk', kwargs.get('rs_traj_trigger_topk', 1)),
+            model=kwargs.get('model', None),
+            args=kwargs.get('args', None),
         )
     else:
         raise ValueError(f"Unknown attack: {attack_name}")
