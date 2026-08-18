@@ -116,11 +116,3 @@ that the OOD-retention loss has a non-zero gradient:
 python test_nidw_smoke.py
 ```
 
-## Notes
-
-- BERT and SASRec backbones are both supported (`--model_code bert|sas`).
-- Attacks only post-process logits at inference time; the model is never
-  re-trained and no parameters are modified.
-- Item popularity used for watermarking and data-aware attacks is computed
-  from the training split only.
-
