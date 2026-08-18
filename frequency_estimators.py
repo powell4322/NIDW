@@ -13,18 +13,19 @@ class FrequencyEstimator:
 
 
 class DataPopularityEstimator(FrequencyEstimator):
+    """Data-aware: popularity from TRAIN interactions only (no held-out leakage)."""
+
     def __init__(self, dataloader, device):
         self.dataloader = dataloader
         self.device = device
 
     def estimate(self):
         freq = torch.zeros(self.dataloader.item_count, device=self.device)
-        for split in [self.dataloader.train, self.dataloader.val, self.dataloader.test]:
-            for items in split.values():
-                if len(items) == 0:
-                    continue
-                idx = torch.tensor(items, device=self.device, dtype=torch.long) - 1
-                freq.index_add_(0, idx, torch.ones_like(idx, dtype=freq.dtype))
+        for items in self.dataloader.train.values():
+            if not items:
+                continue
+            idx = torch.tensor(items, device=self.device, dtype=torch.long) - 1
+            freq.index_add_(0, idx, torch.ones_like(idx, dtype=freq.dtype))
         return _normalize(freq)
 
 
@@ -40,27 +41,36 @@ class UniformPopularityEstimator(FrequencyEstimator):
 
 class QueryExposureEstimator(FrequencyEstimator):
     """
-    QEE: estimate popularity from model queries.
+    QEE: data-unaware popularity estimate from random-prefix model queries.
+
+    No real interaction data is used; random item prefixes are fed to the
+    model and top-k exposure frequencies are aggregated.
     """
 
-    def __init__(self, model, query_loader, device, num_items, topk=20, max_batches=0, temperature=1.0, uniform_mix=0.02):
+    def __init__(self, model, num_items, device, num_queries=2000,
+                 prefix_len=(1, 5), bert_max_len=200, use_mask=True,
+                 topk=20, temperature=1.0, uniform_mix=0.02):
         self.model = model
-        self.query_loader = query_loader
-        self.device = device
         self.num_items = num_items
+        self.device = device
+        self.num_queries = num_queries
+        self.prefix_len = prefix_len
+        self.bert_max_len = bert_max_len
+        self.use_mask = use_mask
         self.topk = topk
-        self.max_batches = max_batches
         self.temperature = temperature
         self.uniform_mix = uniform_mix
 
     def estimate(self):
         return estimate_item_freq_from_model_outputs(
             model=self.model,
-            query_loader=self.query_loader,
-            device=self.device,
             num_items=self.num_items,
+            device=self.device,
+            num_queries=self.num_queries,
+            prefix_len=self.prefix_len,
+            bert_max_len=self.bert_max_len,
+            use_mask=self.use_mask,
             topk=self.topk,
-            max_batches=self.max_batches,
             temperature=self.temperature,
             uniform_mix=self.uniform_mix,
         )
@@ -128,6 +138,32 @@ def _normalize(freq):
     return freq / total
 
 
+def build_train_item_freq(args, export_root, num_items=None, device=None):
+    """Build (and cache) a train-only normalized item frequency vector."""
+    from datasets import dataset_factory
+    device = device if device is not None else args.device
+    num_items = num_items if num_items is not None else args.num_items
+    freq_path = os.path.join(export_root, 'item_freq_train.pt')
+    if os.path.isfile(freq_path):
+        return torch.load(freq_path, map_location=device).to(device)
+    data = dataset_factory(args).load_dataset()
+    item_freq = torch.zeros(num_items, device=device)
+    for items in data['train'].values():
+        if not items:
+            continue
+        idx = torch.tensor(items, device=device, dtype=torch.long) - 1
+        idx = idx[(idx >= 0) & (idx < num_items)]
+        if idx.numel() == 0:
+            continue
+        item_freq.index_add_(0, idx, torch.ones_like(idx, dtype=item_freq.dtype))
+    total = item_freq.sum()
+    if total > 0:
+        item_freq = item_freq / total
+    os.makedirs(export_root, exist_ok=True)
+    torch.save(item_freq.cpu(), freq_path)
+    return item_freq
+
+
 def _canonical_source(source):
     src = source.lower()
     if src == 'model_query':
@@ -139,11 +175,8 @@ def _canonical_source(source):
 
 
 def _build_cache_name(source, params):
-    source = source.lower()
     if source == 'data':
-        # Backward compatible path
-        return 'item_freq.pt'
-
+        return 'item_freq_train.pt'
     digest = hashlib.md5(json.dumps(params, sort_keys=True).encode('utf-8')).hexdigest()[:8]
     return f'item_freq_{source}_{digest}.pt'
 
@@ -155,42 +188,30 @@ def load_or_build_item_freq(
     source='data',
     args=None,
     model=None,
-    query_loader=None,
-    query_topk=20,
-    query_max_batches=0,
-    query_temperature=1.0,
-    query_uniform_mix=0.02,
+    num_queries=2000,
+    prefix_len=(1, 5),
+    topk=20,
+    temperature=1.0,
+    uniform_mix=0.02,
     tpe_alpha=0.5,
 ):
     source = _canonical_source(source)
 
     cache_params = {
         'source': source,
-        'query_topk': query_topk,
-        'query_max_batches': query_max_batches,
-        'query_temperature': query_temperature,
-        'query_uniform_mix': query_uniform_mix,
+        'num_queries': num_queries,
+        'topk': topk,
+        'temperature': temperature,
+        'uniform_mix': uniform_mix,
         'tpe_alpha': tpe_alpha,
     }
-    cache_name = _build_cache_name(source, cache_params)
-    freq_path = os.path.join(export_root, cache_name)
-
-    legacy_paths = []
-    if source == 'data':
-        legacy_paths = [os.path.join(export_root, 'item_freq.pt')]
-    elif source == 'dpe':
-        legacy_paths = [os.path.join(export_root, 'item_freq_dpe.pt')]
-    elif source == 'qee':
-        legacy_paths = [os.path.join(export_root, 'item_freq_qee.pt'), os.path.join(export_root, 'item_freq_model_query.pt')]
-    elif source == 'uniform':
-        legacy_paths = [os.path.join(export_root, 'item_freq_uniform.pt')]
+    freq_path = os.path.join(export_root, _build_cache_name(source, cache_params))
 
     if os.path.isfile(freq_path):
         return torch.load(freq_path, map_location=device).to(device)
 
-    for p in legacy_paths:
-        if os.path.isfile(p):
-            return torch.load(p, map_location=device).to(device)
+    bert_max_len = args.bert_max_len if args is not None else 200
+    use_mask = (args.model_code == 'bert') if args is not None else True
 
     if source == 'uniform':
         estimator = UniformPopularityEstimator(dataloader.item_count, device)
@@ -199,32 +220,24 @@ def load_or_build_item_freq(
             raise ValueError('dpe mode requires args to locate distilled data files.')
         estimator = DistillationPopularityEstimator(args=args, num_items=dataloader.item_count, device=device)
     elif source == 'qee':
-        if model is None or query_loader is None:
-            raise ValueError('qee mode requires both model and query_loader.')
+        if model is None:
+            raise ValueError('qee mode requires model.')
         estimator = QueryExposureEstimator(
-            model=model,
-            query_loader=query_loader,
-            device=device,
-            num_items=dataloader.item_count,
-            topk=query_topk,
-            max_batches=query_max_batches,
-            temperature=query_temperature,
-            uniform_mix=query_uniform_mix,
+            model=model, num_items=dataloader.item_count, device=device,
+            num_queries=num_queries, prefix_len=prefix_len,
+            bert_max_len=bert_max_len, use_mask=use_mask,
+            topk=topk, temperature=temperature, uniform_mix=uniform_mix,
         )
     elif source == 'tpe':
-        if model is None or query_loader is None:
-            raise ValueError('tpe mode requires model and query_loader.')
+        if model is None:
+            raise ValueError('tpe mode requires model.')
         estimator = TransitionPopularityEstimator(
             data_estimator=DataPopularityEstimator(dataloader, device),
             qee_estimator=QueryExposureEstimator(
-                model=model,
-                query_loader=query_loader,
-                device=device,
-                num_items=dataloader.item_count,
-                topk=query_topk,
-                max_batches=query_max_batches,
-                temperature=query_temperature,
-                uniform_mix=query_uniform_mix,
+                model=model, num_items=dataloader.item_count, device=device,
+                num_queries=num_queries, prefix_len=prefix_len,
+                bert_max_len=bert_max_len, use_mask=use_mask,
+                topk=topk, temperature=temperature, uniform_mix=uniform_mix,
             ),
             alpha=tpe_alpha,
         )
@@ -233,18 +246,4 @@ def load_or_build_item_freq(
 
     freq = estimator.estimate()
     torch.save(freq.cpu(), freq_path)
-
-    if source == 'data':
-        legacy_data_path = os.path.join(export_root, 'item_freq.pt')
-        if not os.path.isfile(legacy_data_path):
-            torch.save(freq.cpu(), legacy_data_path)
-    if source == 'dpe':
-        legacy_dpe_path = os.path.join(export_root, 'item_freq_dpe.pt')
-        if not os.path.isfile(legacy_dpe_path):
-            torch.save(freq.cpu(), legacy_dpe_path)
-    if source == 'qee':
-        legacy_qee_path = os.path.join(export_root, 'item_freq_model_query.pt')
-        if not os.path.isfile(legacy_qee_path):
-            torch.save(freq.cpu(), legacy_qee_path)
-
     return freq

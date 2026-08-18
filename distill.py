@@ -36,18 +36,34 @@ def distill(args, bb_model_root=None, export_root=None, resume=False):
         if args.gold:
             bb_model_root = 'experiments/' + bb_model_code + '/' + args.dataset_code
         else:
-            bb_model_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + bb_model_code + '/' + \
-                            args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
-                          '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            wm_type = getattr(args, 'wm_type', 'aow')
+            if wm_type == 'aow':
+                bb_model_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + bb_model_code + '/' + \
+                                args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                              '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            elif wm_type == 'nidw':
+                bb_model_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' + bb_model_code + '/' + \
+                                args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                              '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            else:
+                bb_model_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' + bb_model_code + '/' + \
+                                args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                              '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
 
     if export_root == None:
         folder_name = bb_model_code + '2' + args.model_code + '_autoregressive' + str(args.num_generated_seqs)
         if args.gold:
             export_root = 'experiments/distillation_rank/' + folder_name + '/' + args.dataset_code
         else:
-            export_root = 'experiments/distillation_rank/watermark_test/method_' + str(args.method) + '/' \
-                          + folder_name + '/' + args.dataset_code + '/' + str(args.number_ood_seqs) + '_' \
-                          + str(args.number_ood_val_seqs) + '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            wm_type = getattr(args, 'wm_type', 'aow')
+            if wm_type == 'aow':
+                export_root = 'experiments/distillation_rank/watermark_test/method_' + str(args.method) + '/' \
+                              + folder_name + '/' + args.dataset_code + '/' + str(args.number_ood_seqs) + '_' \
+                              + str(args.number_ood_val_seqs) + '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            else:
+                export_root = 'experiments/distillation_rank/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' \
+                              + folder_name + '/' + args.dataset_code + '/' + str(args.number_ood_seqs) + '_' \
+                              + str(args.number_ood_val_seqs) + '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
 
     bb_model.load_state_dict(torch.load(os.path.join(bb_model_root, 'models', 'best_acc_model.pth'), map_location='cpu', weights_only=False).get(STATE_DICT_KEY))
     if resume:

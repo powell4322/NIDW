@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 class BERTTrainer(metaclass=ABCMeta):
-    def __init__(self, args, model, train_loader, val_loader, test_loader, export_root):
+    def __init__(self, args, model, train_loader, val_loader, test_loader, export_root, oracle_model=None):
         self.args = args
         self.device = args.device
         self.model = model.to(self.device)
@@ -48,6 +48,9 @@ class BERTTrainer(metaclass=ABCMeta):
 
         self.ce = nn.CrossEntropyLoss(ignore_index=0)
         self.attack = None
+        self.oracle_model = oracle_model
+        if self.oracle_model is not None:
+            self.oracle_model.eval()
 
     def train(self):
         accum_iter = 0
@@ -158,11 +161,32 @@ class BERTTrainer(metaclass=ABCMeta):
         return average_metrics
 
     def calculate_loss(self, batch):
-        seqs, labels = batch  # seqs [batch size, seq len]   labels [batch size, seq len]
-        logits = self.model(seqs)  # logits [batch size, seq len, n items]
+        seqs, labels = batch
+        logits = self.model(seqs)
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
         loss = self.ce(logits, labels)
+
+        # NIDW OOD-retention: keep the model's probability of ground-truth items
+        # above the oracle's q-th low quantile. Only p_target carries gradients;
+        # the oracle only provides the quantile reference (frozen).
+        if self.args.wm_type == 'nidw' and self.args.nidw_lambda_ood > 0 and self.oracle_model is not None:
+            with torch.no_grad():
+                oracle_logits = self.oracle_model(seqs)
+                oracle_probs = torch.softmax(
+                    oracle_logits.view(-1, oracle_logits.size(-1)), dim=-1)
+
+            valid = labels > 0
+            if valid.any():
+                log_p_target = torch.log_softmax(logits, dim=-1)[
+                    torch.arange(logits.size(0)), labels]
+                q = getattr(self.args, 'nidw_ood_quantile', 0.1)
+                k = max(1, int(oracle_probs.size(-1) * q))
+                log_q = torch.log(torch.clamp(
+                    torch.kthvalue(oracle_probs, k, dim=-1).values, min=1e-12))
+                l_ood = torch.clamp_min(log_q - log_p_target, 0)
+                loss = loss + self.args.nidw_lambda_ood * l_ood[valid].mean()
+
         return loss
 
     def calculate_metrics(self, batch):

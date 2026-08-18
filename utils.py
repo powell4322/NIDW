@@ -207,12 +207,50 @@ parser.add_argument('--num_alter_items', type=int, default=10)
 ################
 parser.add_argument('--number_ood_seqs', type=float, default=0.0)
 parser.add_argument('--bottom_m', type=int, default=100)
-parser.add_argument('--wm_type', type=str, choices=['aow', 'cps'], default='aow',
-                    help='Watermark type: aow (original) or cps (Curriculum Popularity Shift)')
+parser.add_argument('--wm_type', type=str, choices=['aow', 'cps', 'nidw'], default='aow',
+                    help='Watermark type: aow (original), cps (Curriculum Popularity Shift), nidw (Near In-Distribution Watermarking)')
 parser.add_argument('--cps_q_start', type=float, default=0.25,
                     help='CPS: starting quantile (mid-frequency region)')
 parser.add_argument('--cps_q_end', type=float, default=0.05,
                     help='CPS: ending quantile (tail region)')
+
+# NIDW hyperparameters
+parser.add_argument('--nidw_tau', type=float, default=1.0,
+                    help='NIDW: temperature for sampling sharpness')
+parser.add_argument('--nidw_alpha', type=float, default=0.5,
+                    help='NIDW: popularity prior strength')
+parser.add_argument('--nidw_tau_sim', type=float, default=0.5,
+                    help='NIDW: semantic smoothing temperature')
+parser.add_argument('--nidw_window', type=int, default=3,
+                    help='NIDW: sliding window size for context embedding')
+parser.add_argument('--nidw_seed_len', type=int, default=2,
+                    help='NIDW: max seed prefix length')
+parser.add_argument('--nidw_seed_q_min', type=float, default=0.20,
+                    help='NIDW: lower bound of seed item popularity quantile')
+parser.add_argument('--nidw_seed_q_max', type=float, default=0.40,
+                    help='NIDW: upper bound of seed item popularity quantile')
+parser.add_argument('--nidw_stages', type=int, default=1,
+                    help='NIDW: number of progressive training stages')
+parser.add_argument('--nidw_resume_stage', type=int, default=1,
+                    help='NIDW: resume training from this stage')
+parser.add_argument('--nidw_tau_s1', type=float, default=0,
+                    help='NIDW: temperature for stage 1 (0=use nidw_tau default)')
+parser.add_argument('--nidw_alpha_s1', type=float, default=0,
+                    help='NIDW: popularity prior for stage 1 (0=use nidw_alpha default)')
+parser.add_argument('--nidw_tau_sim_s1', type=float, default=0,
+                    help='NIDW: semantic smoothing temperature for stage 1')
+parser.add_argument('--nidw_tau_s2', type=float, default=0,
+                    help='NIDW: temperature for stage 2')
+parser.add_argument('--nidw_alpha_s2', type=float, default=0,
+                    help='NIDW: popularity prior for stage 2')
+parser.add_argument('--nidw_tau_sim_s2', type=float, default=0,
+                    help='NIDW: semantic smoothing temperature for stage 2')
+parser.add_argument('--nidw_lambda_ood', type=float, default=0.01,
+                    help='NIDW: OOD retention loss weight')
+parser.add_argument('--use_seed_prefix', type=bool, default=True,
+                    help='NIDW: use seed prefix from real user (True) or fallback to cold anchor (False)')
+parser.add_argument('--nidw_ood_quantile', type=float, default=0.1,
+                    help='NIDW: quantile threshold for OOD retention loss')
 
 
 ################
@@ -229,59 +267,61 @@ parser.add_argument('--finetune_ratio', type=float, default=0)
 # Inference-time Attack
 ################
 parser.add_argument('--attack', type=str, default='none',
-                    help='Attack type. Recommended: none | soft_prf | point_level | random_shuffle. Legacy aliases ptsc/pcrmr are accepted for compatibility and mapped to soft_prf.')
-parser.add_argument('--prf_gamma', type=float, default=0.7)
-parser.add_argument('--prf_beta', type=float, default=5.0)
-parser.add_argument('--prf_eps', type=float, default=0.02,
-                    help='Soft-PRF transition smoothness epsilon')
-parser.add_argument('--pl_penalty', type=float, default=5.0,
-                    help='Point-Level attack: score penalty applied to the single target item (most extreme in popularity)')
-parser.add_argument('--rs_noise_scale', type=float, default=1.0,
-                    help='Random Shuffle attack: standard deviation of Gaussian noise')
-parser.add_argument('--rs_seed', type=int, default=42,
-                    help='Random Shuffle attack: random seed for reproducibility')
-parser.add_argument('--rs_mode', type=str, default='random', choices=['random', 'region', 'trajectory'],
-                    help='Random Shuffle mode: random (Gaussian noise), region (SoftPRF-like band), or trajectory (model-query continuation path)')
-parser.add_argument('--rs_region_low', type=float, default=0.2,
-                    help='Random Shuffle region mode: lower quantile bound of penalty band')
-parser.add_argument('--rs_region_high', type=float, default=0.5,
-                    help='Random Shuffle region mode: upper quantile bound of penalty band')
-parser.add_argument('--rs_region_beta', type=float, default=5.0,
-                    help='Random Shuffle region mode: penalty strength inside the band')
-parser.add_argument('--rs_traj_k1', type=int, default=3,
-                    help='Random Shuffle trajectory mode: top-K predictions at level 1')
-parser.add_argument('--rs_traj_k2', type=int, default=1,
-                    help='Random Shuffle trajectory mode: top-K predictions at level 2 (per branch)')
-parser.add_argument('--rs_traj_k3', type=int, default=0,
-                    help='Random Shuffle trajectory mode: top-K at level 3 (0=disabled)')
-parser.add_argument('--rs_traj_k4', type=int, default=0,
-                    help='Random Shuffle trajectory mode: top-K at level 4 (0=disabled)')
-parser.add_argument('--rs_traj_penalty', type=float, default=5.0,
-                    help='Random Shuffle trajectory mode: base penalty strength')
-parser.add_argument('--rs_traj_depth_decay', type=float, default=0.7,
-                    help='Random Shuffle trajectory mode: penalty multiplier per deeper level')
-parser.add_argument('--rs_traj_confidence_weight', action='store_true',
-                    help='Random Shuffle trajectory mode: weight penalty by model softmax confidence')
-parser.add_argument('--rs_traj_trigger_topk', type=int, default=1,
-                    help='Random Shuffle trajectory mode: use top-K triggers instead of 1 (range attack for QEE)')
-parser.add_argument('--ptsc_alpha', type=float, default=6.0)
-parser.add_argument('--pcrmr_sigma', type=float, default=1.0)
-parser.add_argument('--attack_direction', type=str, default='suppress_popular', choices=['suppress_popular', 'suppress_unpopular'])
+                    choices=['none', 'distributional', 'point', 'noise', 'region', 'trajectory', 'unified'],
+                    help='Attack type: distributional (D), trajectory (T), unified (D+T), point, noise, region')
+parser.add_argument('--target', type=str, default=None, choices=['popular', 'unpopular'],
+                    help='Suppression target (default inferred from method: cold->unpopular, pop->popular)')
+# distributional
+parser.add_argument('--dis_threshold', type=float, default=0.7,
+                    help='Distributional attack: popularity rank threshold')
+parser.add_argument('--dis_beta', type=float, default=5.0,
+                    help='Distributional attack: penalty magnitude')
+parser.add_argument('--dis_eps', type=float, default=0.02,
+                    help='Distributional attack: sigmoid transition smoothness')
+# point
+parser.add_argument('--point_beta', type=float, default=5.0,
+                    help='Point attack: penalty applied to the single target item')
+# region baseline
+parser.add_argument('--region_low', type=float, default=0.2,
+                    help='Region attack: lower popularity-quantile bound of the penalty band')
+parser.add_argument('--region_high', type=float, default=0.5,
+                    help='Region attack: upper popularity-quantile bound of the penalty band')
+parser.add_argument('--region_beta', type=float, default=5.0,
+                    help='Region attack: penalty strength inside the band')
+# noise baseline
+parser.add_argument('--noise_scale', type=float, default=1.0,
+                    help='Noise attack: standard deviation of Gaussian noise')
+parser.add_argument('--noise_seed', type=int, default=42,
+                    help='Noise attack: random seed')
+# trajectory / unified
+parser.add_argument('--traj_k1', type=int, default=3,
+                    help='Trajectory attack: top-K predictions at level 1')
+parser.add_argument('--traj_k2', type=int, default=1,
+                    help='Trajectory attack: top-K predictions at level 2 (per branch)')
+parser.add_argument('--traj_beta', type=float, default=5.0,
+                    help='Trajectory attack: base penalty strength')
+parser.add_argument('--traj_depth_decay', type=float, default=1.0,
+                    help='Trajectory attack: penalty multiplier per deeper level')
+parser.add_argument('--traj_trigger_topk', type=int, default=1,
+                    help='Trajectory attack: number of top triggers to union (range attack for QEE)')
+parser.add_argument('--unified_beta1', type=float, default=0.0,
+                    help='Unified attack: distributional coefficient (0=auto by method)')
+parser.add_argument('--unified_beta2', type=float, default=0.0,
+                    help='Unified attack: trajectory coefficient (0=auto by method)')
 parser.add_argument('--item_freq_source', type=str, default='data',
-                    choices=['data', 'model_query', 'uniform', 'dpe', 'qee', 'tpe'],
-                    help='Source of item popularity for attacks: data=data-aware, dpe=distilled-data estimate, qee=query-based estimate, tpe=(1-alpha)*data+alpha*QEE, model_query is legacy alias of qee, uniform=no prior')
+                    choices=['data', 'uniform', 'dpe', 'qee', 'tpe'],
+                    help='Item popularity source for attacks: data=data-aware, qee=query-based estimate, '
+                         'dpe=distilled-data estimate, tpe=(1-alpha)*data+alpha*QEE, uniform=no prior')
 parser.add_argument('--freq_query_topk', type=int, default=20,
-                    help='Top-k outputs used per query when item_freq_source=qee/model_query or tpe')
-parser.add_argument('--freq_query_max_batches', type=int, default=0,
-                    help='Max query batches for qee/model_query estimation (0 means all batches)')
+                    help='Top-k outputs used per query when item_freq_source=qee or tpe')
+parser.add_argument('--freq_query_num', type=int, default=2000,
+                    help='Number of random-prefix queries for qee/tpe estimation')
 parser.add_argument('--freq_query_temperature', type=float, default=1.0,
-                    help='Softmax temperature for qee/model-query popularity estimation')
+                    help='Softmax temperature for qee popularity estimation')
 parser.add_argument('--freq_query_uniform_mix', type=float, default=0.02,
-                    help='Mix ratio with uniform prior to stabilize zero-hit items in qee/model_query mode')
+                    help='Mix ratio with uniform prior to stabilize zero-hit items in qee mode')
 parser.add_argument('--freq_tpe_alpha', type=float, default=0.5,
                     help='Blend ratio for TPE estimator: freq=(1-alpha)*data + alpha*QEE')
-parser.add_argument('--prf_phi_json', type=str, default='',
-                    help='Optional JSON string for unified Soft-PRF params, e.g. {"gamma":0.8,"beta":12.0,"eps":0.02}')
 parser.add_argument('--model_init_seed', type=int, default=98765,
                     help='Random seed used for model initialization and evaluation reproducibility')
 

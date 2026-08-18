@@ -12,26 +12,19 @@ from utils import *
 from attacks import build_attack
 from frequency_estimators import load_or_build_item_freq
 from result_logging import save_standardized_results
-import json
-
-
-'''test the validity of the watermark on watermarked model/oracle model'''
 
 
 def train(args, export_root=None, resume=False):
     args.lr = 0.001
     fix_random_seed_as(args.model_init_seed)
 
-    # 1. Initialize Dataset & Dataloaders
     dataset = dataset_factory(args)
-    
-    # Watermark Test Loader (Synthetic 1000 items)
+
+    # Watermark test loader (synthetic sequences built from the watermark)
     wm_dataloader = TESTDataloader(args, dataset)
     wm_train_loader, wm_val_loader, wm_test_loader = wm_dataloader.get_pytorch_dataloaders()
-    
-    # Original Test Loader (Real Test Set for Utility)
-    # [FIX] Temporarily disable watermark injection for clean loader to avoid crashing (missing pretrained_model)
-    # and to ensure we measure utility on the original clean distribution.
+
+    # Clean loader for utility: disable watermark injection
     original_ood_seqs = args.number_ood_seqs
     args.number_ood_seqs = 0.0
 
@@ -40,7 +33,7 @@ def train(args, export_root=None, resume=False):
     elif args.model_code == 'sas':
         clean_dataloader = SASDataloader(args, dataset)
     else:
-        clean_dataloader = BERTDataloader(args, dataset) # Fallback
+        clean_dataloader = BERTDataloader(args, dataset)  # fallback
 
     clean_train_loader, clean_val_loader, clean_test_loader = clean_dataloader.get_pytorch_dataloaders()
     
@@ -56,15 +49,12 @@ def train(args, export_root=None, resume=False):
         if args.gold:
             export_root = 'experiments/' + args.model_code + '/' + args.dataset_code
         else:
-            # 获取水印类型，默认aow
             wm_type = getattr(args, 'wm_type', 'aow')
             if wm_type == 'aow':
-                # AOW: 保持原有路径格式，向后兼容
                 export_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + args.model_code + '/' + \
                               args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
                               '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
             else:
-                # CPS等新方法: 使用带wm_type的新路径格式
                 export_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' + args.model_code + '/' + \
                               args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
                               '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
@@ -74,13 +64,10 @@ def train(args, export_root=None, resume=False):
     # Initialize Attack
     attack = None
     if args.attack != 'none':
-        phi = json.loads(args.prf_phi_json) if args.prf_phi_json else None
-        print(f"Building attack: {args.attack} (Item Frequency Source: {args.item_freq_source})")
-        # Build frequency from selected source.
-        # data: true interaction histogram; dpe: distilled-data estimate; qee/model_query: query-based estimate.
-        # Verify dimension consistency
+        print(f"[attack] type={args.attack}, freq_source={args.item_freq_source}")
         if clean_dataloader.item_count != wm_dataloader.item_count:
-             print(f"Warning: Item count mismatch! Clean: {clean_dataloader.item_count}, Watermark: {wm_dataloader.item_count}")
+            print(f"[warning] item count mismatch: clean={clean_dataloader.item_count}, "
+                  f"watermark={wm_dataloader.item_count}")
 
         item_freq = load_or_build_item_freq(
             clean_dataloader,
@@ -89,43 +76,23 @@ def train(args, export_root=None, resume=False):
             source=args.item_freq_source,
             args=args,
             model=model,
-            query_loader=clean_test_loader,
-            query_topk=args.freq_query_topk,
-            query_max_batches=args.freq_query_max_batches,
-            query_temperature=args.freq_query_temperature,
-            query_uniform_mix=args.freq_query_uniform_mix,
+            num_queries=args.freq_query_num,
+            topk=args.freq_query_topk,
+            temperature=args.freq_query_temperature,
+            uniform_mix=args.freq_query_uniform_mix,
             tpe_alpha=args.freq_tpe_alpha,
         )
         attack = build_attack(
-            args.attack,
-            item_freq,
-            gamma=args.prf_gamma,
-            beta=args.prf_beta,
-            eps=args.prf_eps,
-            phi=phi,
-            method=args.method,
-            alpha=args.ptsc_alpha,
-            sigma=args.pcrmr_sigma,
-            direction=args.attack_direction,
-            model=model if args.attack != 'none' else None,
-            args=args,
-            # RandomShuffle params
-            rs_mode=args.rs_mode,
-            rs_noise_scale=args.rs_noise_scale,
-            rs_seed=args.rs_seed,
-            rs_region_low=args.rs_region_low,
-            rs_region_high=args.rs_region_high,
-            rs_region_beta=args.rs_region_beta,
-            rs_traj_k1=args.rs_traj_k1,
-            rs_traj_k2=args.rs_traj_k2,
-            rs_traj_k3=args.rs_traj_k3,
-            rs_traj_k4=args.rs_traj_k4,
-            rs_traj_penalty=args.rs_traj_penalty,
-            rs_traj_depth_decay=args.rs_traj_depth_decay,
-            rs_traj_confidence_weight=args.rs_traj_confidence_weight,
-            rs_traj_trigger_topk=args.rs_traj_trigger_topk,
-            # PointLevel params
-            pl_penalty=args.pl_penalty,
+            args.attack, item_freq,
+            model=model, args=args, method=args.method, target=args.target,
+            threshold=args.dis_threshold, beta=args.dis_beta, eps=args.dis_eps,
+            point_beta=args.point_beta,
+            noise_scale=args.noise_scale, seed=args.noise_seed,
+            low=args.region_low, high=args.region_high, region_beta=args.region_beta,
+            k1=args.traj_k1, k2=args.traj_k2,
+            traj_beta=args.traj_beta, depth_decay=args.traj_depth_decay,
+            trigger_topk=args.traj_trigger_topk,
+            beta1=args.unified_beta1, beta2=args.unified_beta2,
         )
 
     # Setup Trainer
@@ -137,23 +104,21 @@ def train(args, export_root=None, resume=False):
     if attack is not None:
         trainer.attack = attack
 
-    print("==============================================")
-    print(f"Running Evaluation with Attack: {args.attack} | Direction: {args.attack_direction}")
-    print("==============================================")
+    print(f"[eval] attack={args.attack} target={args.target}")
 
-    # 2. Evaluate on Watermark Test Set (Robustness)
-    print("\n[Metric 1/2] Evaluating Watermark Robustness...")
+    # Evaluate watermark robustness on the synthetic watermark test set
     wm_metrics = trainer.test(test_watermark=True)
-    print(f"Watermark Detection Success (HR@1/5/10): {wm_metrics.get('Recall@1', 0):.4f} / {wm_metrics.get('Recall@5', 0):.4f} / {wm_metrics.get('Recall@10', 0):.4f}")
+    print(f"[wm] Recall@1={wm_metrics.get('Recall@1', 0):.4f} "
+          f"Recall@5={wm_metrics.get('Recall@5', 0):.4f} "
+          f"Recall@10={wm_metrics.get('Recall@10', 0):.4f}")
 
-    # 3. Evaluate on Clean Test Set (Utility)
-    print("\n[Metric 2/2] Evaluating Model Utility (Clean Test Set)...")
-    # Swap to clean test loader
+    # Evaluate utility on the clean test set
     trainer.test_loader = clean_test_loader
     util_metrics = trainer.test(test_watermark=False)
-    print(f"Model Utility (NDCG@10): {util_metrics.get('NDCG@10', 0):.4f}")
+    print(f"[util] NDCG@10={util_metrics.get('NDCG@10', 0):.4f} "
+          f"Recall@10={util_metrics.get('Recall@10', 0):.4f}")
 
-    # 4. Save standardized outputs (JSON + CSV)
+    # Save standardized outputs (JSON + CSV)
     json_path, csv_path = save_standardized_results(
         export_root=export_root,
         args=args,
@@ -162,8 +127,7 @@ def train(args, export_root=None, resume=False):
         util_metrics=util_metrics,
         file_stem='evaluation_results',
     )
-    print(f"\nAll results saved to: {json_path}")
-    print(f"Summary row appended to: {csv_path}")
+    print(f"[done] results saved to {json_path}")
 
 
 if __name__ == "__main__":
@@ -174,10 +138,5 @@ if __name__ == "__main__":
     args.train_batch_size = batch
     args.val_batch_size = batch
     args.test_batch_size = batch
-
-    # when use k-core beauty and k is not 5 (beauty-dense)
-    # args.min_uc = k
-    # args.min_sc = k
-
 
     train(args, resume=False)

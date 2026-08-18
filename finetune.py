@@ -1,13 +1,13 @@
 import os
-from datasets import DATASETS
+from datasets import DATASETS, dataset_factory
 from config import STATE_DICT_KEY
-import argparse
 import torch
 from model import *
 from dataloader import *
 from trainer import *
 from utils import *
 from attacks import build_attack
+from frequency_estimators import build_train_item_freq
 
 
 def train(args, export_root=None, resume=False):
@@ -19,16 +19,19 @@ def train(args, export_root=None, resume=False):
     dataset = dataset_factory(args)
 
     oracle_model = None
+    if args.dataset_code == 'ml-1m':
+        args.num_items = 3416
+    elif args.dataset_code == 'ml-20m':
+        args.num_items = 18345
+    elif args.dataset_code == 'steam':
+        args.num_items = 13046
+    elif args.dataset_code == 'beauty':
+        args.num_items = 54542
+
     if args.model_code == 'bert':
-        if args.dataset_code == 'ml-1m':
-            args.num_items = 3416
-        elif args.dataset_code == 'ml-20m':
-            args.num_items = 18345
-        elif args.dataset_code == 'steam':
-            args.num_items = 13046
-        elif args.dataset_code == 'beauty':
-            args.num_items = 54542
         oracle_model = BERT(args)
+    elif args.model_code == 'sas':
+        oracle_model = SASRec(args)
     else:
         raise NotImplementedError('Model not implemented for fine-tuning!')
     root = 'experiments/' + args.model_code + '/' + args.dataset_code
@@ -47,13 +50,23 @@ def train(args, export_root=None, resume=False):
     elif args.model_code == 'sas':
         model = SASRec(args)
 
-    before_finetune_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + args.model_code + '/' + \
-                  args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
-                  '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+    wm_type = getattr(args, 'wm_type', 'aow')
+    if wm_type == 'aow':
+        before_finetune_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + args.model_code + '/' + \
+                      args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                      '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
 
-    export_root = 'experiments/watermark_test_after_finetune/method_' + str(args.method) + '/' + args.model_code + '/' + \
-                  args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
-                  '_' + str(args.pattern_len) + '_' + str(args.bottom_m) + '_' + str(args.finetune_ratio)
+        export_root = 'experiments/watermark_test_after_finetune/method_' + str(args.method) + '/' + args.model_code + '/' + \
+                      args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                      '_' + str(args.pattern_len) + '_' + str(args.bottom_m) + '_' + str(args.finetune_ratio)
+    else:
+        before_finetune_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' + args.model_code + '/' + \
+                      args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                      '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+
+        export_root = 'experiments/watermark_test_after_finetune/method_' + str(args.method) + '/' + wm_type + '/' + args.model_code + '/' + \
+                      args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
+                      '_' + str(args.pattern_len) + '_' + str(args.bottom_m) + '_' + str(args.finetune_ratio)
 
     model.load_state_dict(torch.load(os.path.join(before_finetune_root, 'models', 'best_acc_model.pth'), map_location='cpu', weights_only=False).get(STATE_DICT_KEY))
 
@@ -74,36 +87,19 @@ def train(args, export_root=None, resume=False):
 
     # Optional: apply inference-time attack during testing
     if hasattr(args, 'attack') and args.attack != 'none':
-        # Build item frequency
-        freq_path = os.path.join(export_root, 'item_freq.pt')
-        if os.path.isfile(freq_path):
-            item_freq = torch.load(freq_path, map_location=args.device).to(args.device)
-        else:
-            # Build from dataset
-            from datasets import dataset_factory as df
-            dataset_obj = df(args)
-            loaded_data = dataset_obj.load_dataset()
-            item_freq = torch.zeros(args.num_items, device=args.device)
-            for split in [loaded_data['train'], loaded_data['val'], loaded_data['test']]:
-                for items in split.values():
-                    if len(items) == 0:
-                        continue
-                    idx = torch.tensor(items, device=args.device, dtype=torch.long) - 1
-                    item_freq.index_add_(0, idx, torch.ones_like(idx, dtype=item_freq.dtype))
-            total = item_freq.sum()
-            if total > 0:
-                item_freq = item_freq / total
-            torch.save(item_freq.cpu(), freq_path)
-        
-        attack = build_attack(
-            args.attack,
-            item_freq,
-            gamma=args.prf_gamma,
-            beta=args.prf_beta,
-            alpha=args.ptsc_alpha,
-            sigma=args.pcrmr_sigma
+        item_freq = build_train_item_freq(args, export_root)
+        trainer.attack = build_attack(
+            args.attack, item_freq,
+            model=model, args=args, method=args.method, target=args.target,
+            threshold=args.dis_threshold, beta=args.dis_beta, eps=args.dis_eps,
+            point_beta=args.point_beta,
+            noise_scale=args.noise_scale, seed=args.noise_seed,
+            low=args.region_low, high=args.region_high, region_beta=args.region_beta,
+            k1=args.traj_k1, k2=args.traj_k2,
+            traj_beta=args.traj_beta, depth_decay=args.traj_depth_decay,
+            trigger_topk=args.traj_trigger_topk,
+            beta1=args.unified_beta1, beta2=args.unified_beta2,
         )
-        trainer.attack = attack
 
     trainer.train()
     trainer.test(test_watermark=False)

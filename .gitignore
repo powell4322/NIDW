@@ -1,11 +1,46 @@
-
-data/
-experiments/
-sequence pattern/
-
-
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.venv/
+
+# Data & generated artifacts
+data/
+gen_data/
+sequence pattern/
+*.npy
+
+# Experiment outputs (logs, checkpoints, results)
+experiments/
 *.tmp
 *.log
+
+# Internal research notes (not for the public repo)
+攻击理论与OOD缺陷.md
+论文框架总览.md
+论文图片使用说明.md
+实验一.md
+实验一运行命令.md
+实验二.md
+实验二运行命令.md
+实验三.md
+实验运行命令.md
+水印训练与测评总结.md
+原论文命令.md
+AOW论文注意点.md
+NIDW设计文档.md
+PRF_ATTACK.md
+SKILL_ATTACK.md
+skills/
+figure/
+
+# Legacy / debug scripts not part of the release pipeline
+test_attack.py
+verify_exp2_commands.py
+debug_eval.py
+diagnose_ood_mismatch.py
+compute_watermark_popularity.py
+gen_watermark_seq.py
+
+# OS / editor
+.DS_Store
+Thumbs.db

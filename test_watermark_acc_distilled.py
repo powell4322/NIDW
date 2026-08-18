@@ -10,7 +10,6 @@ from utils import *
 from attacks import build_attack
 from frequency_estimators import load_or_build_item_freq
 from result_logging import save_standardized_results
-import json
 
 
 '''test watermark validity on distilled model'''
@@ -34,8 +33,13 @@ def train(args, export_root=None, resume=False):
         if args.gold:
             export_root = 'experiments/distillation_rank/' + folder_name + '/' + args.dataset_code
         else:
-            export_root = 'experiments/distillation_rank/watermark_test/method_' + str(args.method) + '/' + folder_name + '/' + args.dataset_code + '/' + str(
-                args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            wm_type = getattr(args, 'wm_type', 'aow')
+            if wm_type == 'aow':
+                export_root = 'experiments/distillation_rank/watermark_test/method_' + str(args.method) + '/' + folder_name + '/' + args.dataset_code + '/' + str(
+                    args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
+            else:
+                export_root = 'experiments/distillation_rank/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' + folder_name + '/' + args.dataset_code + '/' + str(
+                    args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
 
     model.load_state_dict(torch.load(os.path.join(export_root, 'models', 'best_acc_model.pth'), map_location='cpu', weights_only=False).get(STATE_DICT_KEY))
 
@@ -46,27 +50,25 @@ def train(args, export_root=None, resume=False):
         source=args.item_freq_source,
         args=args,
         model=model,
-        query_loader=test_loader,
-        query_topk=args.freq_query_topk,
-        query_max_batches=args.freq_query_max_batches,
-        query_temperature=args.freq_query_temperature,
-        query_uniform_mix=args.freq_query_uniform_mix,
+        num_queries=args.freq_query_num,
+        topk=args.freq_query_topk,
+        temperature=args.freq_query_temperature,
+        uniform_mix=args.freq_query_uniform_mix,
         tpe_alpha=args.freq_tpe_alpha,
     )
     attack = None
     if args.attack != 'none':
-        phi = json.loads(args.prf_phi_json) if args.prf_phi_json else None
         attack = build_attack(
-            args.attack,
-            item_freq,
-            gamma=args.prf_gamma,
-            beta=args.prf_beta,
-            eps=args.prf_eps,
-            phi=phi,
-            method=args.method,
-            alpha=args.ptsc_alpha,
-            sigma=args.pcrmr_sigma,
-            direction=args.attack_direction,
+            args.attack, item_freq,
+            model=model, args=args, method=args.method, target=args.target,
+            threshold=args.dis_threshold, beta=args.dis_beta, eps=args.dis_eps,
+            point_beta=args.point_beta,
+            noise_scale=args.noise_scale, seed=args.noise_seed,
+            low=args.region_low, high=args.region_high, region_beta=args.region_beta,
+            k1=args.traj_k1, k2=args.traj_k2,
+            traj_beta=args.traj_beta, depth_decay=args.traj_depth_decay,
+            trigger_topk=args.traj_trigger_topk,
+            beta1=args.unified_beta1, beta2=args.unified_beta2,
         )
 
     if args.model_code == 'bert':

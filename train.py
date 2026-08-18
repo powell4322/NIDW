@@ -1,15 +1,13 @@
 import os
-import os
-from datasets import DATASETS
+from datasets import DATASETS, dataset_factory
 from config import STATE_DICT_KEY
-import argparse
 import torch
 from model import *
 from dataloader import *
 from trainer import *
 from utils import *
 from attacks import build_attack
-from attacks import build_attack
+from frequency_estimators import build_train_item_freq
 
 
 def train(args, export_root=None, resume=False):
@@ -56,15 +54,15 @@ def train(args, export_root=None, resume=False):
     if args.gold:
         export_root = 'experiments/' + args.model_code + '/' + args.dataset_code
     else:
-        # 获取水印类型，默认aow
+     
         wm_type = getattr(args, 'wm_type', 'aow')
         if wm_type == 'aow':
-            # AOW: 保持原有路径格式，向后兼容
+           
             export_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + args.model_code + '/' + \
                           args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
                           '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
         else:
-            # CPS等新方法: 使用带wm_type的新路径格式
+           
             export_root = 'experiments/watermark_test/method_' + str(args.method) + '/' + wm_type + '/' + args.model_code + '/' + \
                           args.dataset_code + '/' + str(args.number_ood_seqs) + '_' + str(args.number_ood_val_seqs) + \
                           '_' + str(args.pattern_len) + '_' + str(args.bottom_m)
@@ -81,53 +79,84 @@ def train(args, export_root=None, resume=False):
         model.load_state_dict(torch.load(os.path.join(gold_model_root, 'models', 'best_acc_model.pth'), map_location='cpu', weights_only=False).get(STATE_DICT_KEY))
 
     if args.model_code == 'bert':
-        trainer = BERTTrainer(args, model, train_loader, val_loader, test_loader, export_root)
-    if args.model_code == 'sas':
-        trainer = SASTrainer(args, model, train_loader, val_loader, test_loader, export_root)
+        wm_type = getattr(args, 'wm_type', 'aow')
+        oracle_model_ref = oracle_model if wm_type == 'nidw' else None
 
-    # Optional: apply inference-time attack during testing
-    if hasattr(args, 'attack') and args.attack != 'none':
-        # Build item frequency
-        freq_path = os.path.join(export_root, 'item_freq.pt')
-        if os.path.isfile(freq_path):
-            item_freq = torch.load(freq_path, map_location=args.device).to(args.device)
-        else:
-            # Build from dataset
-            dataset_obj = dataset_factory(args)
-            loaded_data = dataset_obj.load_dataset()
-            item_freq = torch.zeros(args.num_items, device=args.device)
-            for split in [loaded_data['train'], loaded_data['val'], loaded_data['test']]:
-                for items in split.values():
-                    if len(items) == 0:
-                        continue
-                    idx = torch.tensor(items, device=args.device, dtype=torch.long) - 1
-                    item_freq.index_add_(0, idx, torch.ones_like(idx, dtype=item_freq.dtype))
-            total = item_freq.sum()
-            if total > 0:
-                item_freq = item_freq / total
-            torch.save(item_freq.cpu(), freq_path)
-        
-        attack = build_attack(
-            args.attack,
-            item_freq,
-            gamma=args.prf_gamma,
-            beta=args.prf_beta,
-            alpha=args.ptsc_alpha,
-            sigma=args.pcrmr_sigma
-        )
-        trainer.attack = attack
+        nidw_stages = getattr(args, 'nidw_stages', 1)
+        stage_start = getattr(args, 'nidw_resume_stage', 1)
 
-    trainer.train()
-    trainer.test(test_watermark=False)
+        for stage in range(stage_start, nidw_stages + 1):
+            if nidw_stages > 1:
+                print(f'[NIDW] Progressive stage {stage}/{nidw_stages}')
+                if stage == 1:
+                    args.nidw_tau = args.nidw_tau_s1 if args.nidw_tau_s1 > 0 else args.nidw_tau
+                    args.nidw_alpha = args.nidw_alpha_s1 if args.nidw_alpha_s1 > 0 else args.nidw_alpha
+                    args.nidw_tau_sim = args.nidw_tau_sim_s1 if args.nidw_tau_sim_s1 > 0 else args.nidw_tau_sim
+                elif stage == 2:
+                    args.nidw_tau = args.nidw_tau_s2 if args.nidw_tau_s2 > 0 else 1.0
+                    args.nidw_alpha = args.nidw_alpha_s2 if args.nidw_alpha_s2 > 0 else 0.5
+                    args.nidw_tau_sim = args.nidw_tau_sim_s2 if args.nidw_tau_sim_s2 > 0 else 0.5
+                # Regenerate dataloader so each stage gets stage-specific watermark
+                train_loader, val_loader, test_loader = dataloader_factory(
+                    args, args.model_code, oracle_model=oracle_model)
+
+            if stage > 1:
+                prev_stage_root = export_root + f'_stage{stage-1}'
+                try:
+                    model = BERT(args)
+                    model.load_state_dict(torch.load(
+                        os.path.join(prev_stage_root, 'models', 'best_acc_model.pth'),
+                        map_location='cpu', weights_only=False).get(STATE_DICT_KEY))
+                    print(f'[NIDW] Loaded checkpoint from stage {stage-1}')
+                except Exception:
+                    print(f'[NIDW] No checkpoint for stage {stage-1}, training from scratch')
+
+            stage_export = export_root if nidw_stages <= 1 else export_root + f'_stage{stage}'
+            trainer = BERTTrainer(args, model, train_loader, val_loader, test_loader, stage_export,
+                                  oracle_model=oracle_model_ref)
+
+            if hasattr(args, 'attack') and args.attack != 'none':
+                item_freq = build_train_item_freq(args, stage_export)
+                trainer.attack = build_attack(
+                    args.attack, item_freq, model=model, args=args, method=args.method, target=args.target,
+                    threshold=args.dis_threshold, beta=args.dis_beta, eps=args.dis_eps,
+                    point_beta=args.point_beta,
+                    noise_scale=args.noise_scale, seed=args.noise_seed,
+                    low=args.region_low, high=args.region_high, region_beta=args.region_beta,
+                    k1=args.traj_k1, k2=args.traj_k2,
+                    traj_beta=args.traj_beta, depth_decay=args.traj_depth_decay,
+                    trigger_topk=args.traj_trigger_topk,
+                    beta1=args.unified_beta1, beta2=args.unified_beta2,
+                )
+
+            trainer.train()
+            trainer.test(test_watermark=False)
+            if nidw_stages > 1:
+                print(f'[NIDW] Stage {stage} complete')
+    else:
+        if args.model_code == 'sas':
+            trainer = SASTrainer(args, model, train_loader, val_loader, test_loader, export_root)
+            if hasattr(args, 'attack') and args.attack != 'none':
+                item_freq = build_train_item_freq(args, export_root)
+                trainer.attack = build_attack(
+                    args.attack, item_freq, model=model, args=args, method=args.method, target=args.target,
+                    threshold=args.dis_threshold, beta=args.dis_beta, eps=args.dis_eps,
+                    point_beta=args.point_beta,
+                    noise_scale=args.noise_scale, seed=args.noise_seed,
+                    low=args.region_low, high=args.region_high, region_beta=args.region_beta,
+                    k1=args.traj_k1, k2=args.traj_k2,
+                    traj_beta=args.traj_beta, depth_decay=args.traj_depth_decay,
+                    trigger_topk=args.traj_trigger_topk,
+                    beta1=args.unified_beta1, beta2=args.unified_beta2,
+                )
+            trainer.train()
+            trainer.test(test_watermark=False)
 
 
 if __name__ == "__main__":
     set_template(args)
 
     batch = 128
-    # 注释掉硬编码的1000轮，使用命令行参数或set_template中的默认值
-    # if args.gold or args.dataset_code == 'ml-1m':
-    #     args.num_epochs = 1000
     args.train_batch_size = batch
     args.val_batch_size = batch
     args.test_batch_size = batch

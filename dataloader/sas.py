@@ -48,28 +48,19 @@ class SASDataloader():
         self.test_users = self.valid_users
         if not args.gold and distill==False:
             if args.number_ood_seqs != 0:
-                item_frequency = list([0 for i in range(self.item_count)])
-                average_len = 0
+                # Popularity from TRAIN interactions only (no held-out leakage)
+                item_frequency = torch.zeros(self.item_count)
                 for key in self.train.keys():
-                    average_len += len(self.train[key])
                     for item in self.train[key]:
                         item_frequency[item-1] += 1
-                for key in self.val.keys():
-                    for item in self.val[key]:
-                        item_frequency[item-1] += 1
-                for key in self.test.keys():
-                    for item in self.test[key]:
-                        item_frequency[item-1] += 1
-                sorted_, indices = torch.sort(torch.Tensor(item_frequency), descending=False)
-                indices = indices + 1
+                indices = torch.argsort(item_frequency) + 1
                 number_ood_users = int(args.number_ood_seqs * self.user_count)
                 number_ood_val_users = int(args.number_ood_val_seqs * self.user_count)
 
-                self.all_lengths = []
                 if not os.path.isdir('./sequence pattern'):
                     os.mkdir('./sequence pattern')
                 # Autoregressively generate a OOD sequence, then train the model normally to remember it.
-                if args.method == 'cold':
+                if args.method == 'cold' and getattr(args, 'wm_type', 'aow') != 'nidw':
                     start_item = int(indices[0])
                     np.save('./sequence pattern/cold initial item %s %s.npy' % (args.model_code, args.dataset_code), start_item)
 
@@ -109,7 +100,7 @@ class SASDataloader():
                         self.val[val_new_user_idx] = list(whole_sequence)
                     self.valid_users = sorted(
                         self.valid_users + sorted(list(range(new_user_idx + 1, val_new_user_idx + 1))))
-                elif args.method == 'pop':
+                elif args.method == 'pop' and getattr(args, 'wm_type', 'aow') != 'nidw':
                     start_item = int(indices[-1])
                     np.save('./sequence pattern/pop initial item %s %s.npy' % (args.model_code, args.dataset_code), start_item)
 
@@ -150,6 +141,102 @@ class SASDataloader():
                         self.val[val_new_user_idx] = list(whole_sequence)
                     self.valid_users = sorted(
                         self.valid_users + sorted(list(range(new_user_idx + 1, val_new_user_idx + 1))))
+
+                # ========== NIDW: Near In-Distribution Watermarking (SASRec) ==========
+                elif hasattr(args, 'wm_type') and args.wm_type == 'nidw':
+                    print(f'[NIDW][SASRec] Generating near-ID watermark sequence '
+                          f'(tau={args.nidw_tau}, alpha={args.nidw_alpha}, '
+                          f'tau_sim={args.nidw_tau_sim}, window={args.nidw_window})')
+
+                    # Step 1: item popularity quantile from TRAIN interactions only
+                    item_freq = torch.zeros(self.item_count, dtype=torch.float64)
+                    for items in self.train.values():
+                        if items:
+                            idx = torch.tensor(items, dtype=torch.long) - 1
+                            item_freq.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float64))
+                    pop_order = torch.argsort(item_freq)
+                    pop_quantile = torch.empty(self.item_count, dtype=torch.float64)
+                    pop_quantile[pop_order] = torch.linspace(
+                        0.0, 1.0, self.item_count, dtype=torch.float64)
+                    pi_raw = item_freq / item_freq.sum()
+
+                    # Step 2: seed prefix from a real train user, or cold anchor fallback
+                    if getattr(args, 'use_seed_prefix', True):
+                        q_min, q_max = args.nidw_seed_q_min, args.nidw_seed_q_max
+                        eligible = [(uid, seq) for uid, seq in self.train.items()
+                                    if uid <= self.user_count and len(seq) >= 1
+                                    and q_min <= pop_quantile[int(seq[0]) - 1].item() <= q_max]
+                        if not eligible:
+                            raise RuntimeError(
+                                f'[NIDW] No real user with first-item popularity in [{q_min}, {q_max}]')
+                        _, seed_seq = eligible[np.random.randint(0, len(eligible))]
+                        seed_len = min(args.nidw_seed_len, len(seed_seq))
+                        wm_prefix = [int(seed_seq[i]) for i in range(seed_len)]
+                    else:
+                        wm_prefix = [int(indices[0])]
+
+                    # Step 3: oracle embeddings for semantic smoothing
+                    oracle_embeddings = pretrained_model.embedding.token.weight.detach()
+                    item_emb = oracle_embeddings[1:1 + self.item_count]
+                    item_emb_norm = torch.nn.functional.normalize(item_emb, p=2, dim=1)
+
+                    pretrained_model.eval()
+                    seqs = torch.tensor(wm_prefix, dtype=torch.float32, device=args.device)
+                    seen_items = set(wm_prefix)
+                    r = len(wm_prefix)
+
+                    for t in range(r, args.pattern_len):
+                        input_seqs = torch.zeros((1, self.max_len), device=args.device)
+                        input_seqs[:, (self.max_len - len(seqs)):] = seqs
+
+                        with torch.no_grad():
+                            logits = pretrained_model(input_seqs.long())[:, -1, 1:]
+
+                        # Factor 1: temperature-shaped oracle preference
+                        p_tau = torch.softmax(logits / args.nidw_tau, dim=-1).squeeze(0)
+                        # Factor 2: popularity prior
+                        pi_alpha = pi_raw ** args.nidw_alpha
+                        # Factor 3: semantic smoothing over the most recent window items
+                        w_sim = torch.ones(self.item_count, device=args.device)
+                        if t >= 1:
+                            recent = seqs[-min(args.nidw_window, len(seqs)):].long()
+                            e_bar_norm = torch.nn.functional.normalize(
+                                item_emb[recent - 1].mean(dim=0).unsqueeze(0), p=2, dim=1)
+                            cos_sim = torch.mv(item_emb_norm, e_bar_norm.squeeze(0))
+                            w_sim = torch.exp(cos_sim / args.nidw_tau_sim)
+
+                        q = p_tau * pi_alpha.to(args.device) * w_sim
+                        seen_idx = torch.tensor(sorted(seen_items), dtype=torch.long,
+                                                device=args.device) - 1
+                        q[seen_idx] = 0.0
+                        if q.sum() <= 0:
+                            q = torch.ones(self.item_count, device=args.device)
+                            q[seen_idx] = 0.0
+                        q = q / q.sum()
+
+                        next_item = int(torch.multinomial(q, 1).item() + 1)
+                        seen_items.add(next_item)
+                        seqs = torch.cat(
+                            [seqs, torch.tensor([next_item], dtype=torch.float32, device=args.device)])
+
+                    wm_seq = [int(x) for x in seqs.cpu().numpy().tolist()]
+                    print(f'[NIDW] Watermark sequence: {wm_seq}')
+
+                    os.makedirs('./sequence pattern', exist_ok=True)
+                    np.save('./sequence pattern/nidw_watermark_seq_%s_%d_%s_%d.npy' % (
+                        args.dataset_code, args.pattern_len, args.model_code, args.bottom_m),
+                        np.array(wm_seq, dtype=np.int64))
+
+                    for i in range(number_ood_users):
+                        self.train[self.user_count + i + 1] = wm_seq
+                    for i in range(number_ood_val_users):
+                        val_new_user_idx = self.user_count + number_ood_users + i + 1
+                        length = np.random.randint(2, args.pattern_len + 1)
+                        self.val[val_new_user_idx] = list(wm_seq[:length])
+                    self.valid_users = sorted(
+                        self.valid_users + sorted(
+                            list(range(self.user_count + number_ood_users + 1,
+                                       val_new_user_idx + 1))))
 
         self.seen_samples = {}
         for user in self.train.keys():

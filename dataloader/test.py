@@ -35,11 +35,10 @@ class TESTDataloader():
             for item in self.test[key]:
                 item_frequency[item-1] += 1
         
-        # 根据wm_type选择加载的水印序列文件
+        # Load the watermark sequence file matching wm_type
         wm_type = getattr(args, 'wm_type', 'aow')
         
         if wm_type == 'cps':
-            # CPS: 加载课程迁移生成的序列
             if args.method == 'cold':
                 candidate_items = np.load('./sequence pattern/cps_cold_watermark_seq_%s_%d_%s_%d.npy' % (
                     args.dataset_code, args.pattern_len, args.model_code, args.bottom_m))
@@ -48,8 +47,10 @@ class TESTDataloader():
                     args.dataset_code, args.pattern_len, args.model_code, args.bottom_m))
             else:
                 raise ValueError('Please check the method parameter!')
+        elif wm_type == 'nidw':
+            candidate_items = np.load('./sequence pattern/nidw_watermark_seq_%s_%d_%s_%d.npy' % (
+                args.dataset_code, args.pattern_len, args.model_code, args.bottom_m))
         else:
-            # AOW: 加载原始方法生成的序列
             if args.method == 'cold':
                 candidate_items = np.load('./sequence pattern/cold watermark seq %s %d %s %d.npy' % (
                     args.dataset_code, args.pattern_len, args.model_code, args.bottom_m))
